@@ -1,0 +1,138 @@
+# Local deployment of the FULL architecture: `docker compose up --build`
+#
+#   orderbook (Go API + matching engine + settlement)
+#     ├── redpanda  : durable ordered event log  (Kafka API)
+#     ├── postgres  : wallets, trades, orders, settlement journal (ACID)
+#     └── redis     : hot read cache for wallet lookups
+#
+# Every dependency has a healthcheck and the app waits for them
+# (`condition: service_healthy`), so a single `up` brings the stack online in
+# the right order with no manual steps. The schema is applied by the app itself
+# at startup (idempotent), so there is no migration container to run.
+#
+# To run WITHOUT any infrastructure (pure in-memory MVP), use:
+#   docker compose -f docker-compose.memory.yml up --build
+
+name: orderbook
+
+services:
+  orderbook:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      SYMBOL: "VIB"
+      LOG_LEVEL: "info"
+
+      # --- Adapter selection: the real infrastructure ---
+      EVENT_LOG_DRIVER: "kafka"
+      WALLET_STORE_DRIVER: "postgres"
+      TRADE_STORE_DRIVER: "postgres"
+      ORDER_STORE_DRIVER: "postgres"
+      CACHE_DRIVER: "redis"
+
+      # --- Connection settings ---
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_EVENTS_TOPIC: "orderbook.events"
+      KAFKA_CONSUMER_GROUP: "settlement"
+      DATABASE_URL: "postgres://orderbook:orderbook@postgres:5432/orderbook?sslmode=disable"
+      DB_MAX_CONNS: "40"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_TTL: "2s"
+
+      ENGINE_BUFFER: "65536"
+      INFRA_WAIT_TIMEOUT: "60s"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/orderbook", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # Kafka-compatible ordered log. One partition per symbol preserves the total
+  # order the matching engine depends on.
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      - --advertise-kafka-addr=INTERNAL://redpanda:9092,EXTERNAL://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      # 19092 is the host-facing listener, for `rpk`/debugging from your machine.
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Wallets + trades + orders + settlement journal. ACID is why money lives here.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orderbook
+      POSTGRES_PASSWORD: orderbook
+      POSTGRES_DB: orderbook
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderbook -d orderbook"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command:
+      # Modest tuning so the load test is not bottlenecked on connections.
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "synchronous_commit=off"
+
+  # Read cache in front of wallet lookups. Never authoritative.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Optional web UI to inspect the event log during a demo (traceability).
+  # Not required by the service; remove it freely.
+  console:
+    image: redpandadata/console:v2.7.2
+    environment:
+      KAFKA_BROKERS: "redpanda:9092"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redpanda-data:

@@ -1,0 +1,31 @@
+# Zero-infrastructure deployment: the pure in-memory MVP.
+#
+#   docker compose -f docker-compose.memory.yml up --build
+#
+# Same binary, same code paths, all adapters set to "memory". Useful to show
+# that the hexagonal design makes infrastructure a configuration choice, and to
+# get a working API with a single container and no dependencies.
+
+name: orderbook-memory
+
+services:
+  orderbook:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      SYMBOL: "VIB"
+      LOG_LEVEL: "info"
+      EVENT_LOG_DRIVER: "memory"
+      WALLET_STORE_DRIVER: "memory"
+      TRADE_STORE_DRIVER: "memory"
+      ORDER_STORE_DRIVER: "memory"
+      CACHE_DRIVER: "none"
+      ENGINE_BUFFER: "65536"
+    healthcheck:
+      test: ["CMD", "/orderbook", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped

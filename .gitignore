@@ -1,0 +1,17 @@
+# Binaries
+#
+# These patterns are anchored with a leading "/" on purpose: an unanchored
+# `orderbook` / `loadtest` would match at ANY depth and silently exclude the
+# source directories cmd/orderbook/ and scripts/loadtest/.
+/bin/
+/orderbook
+/loadtest
+*.exe
+
+# Test / coverage
+*.out
+coverage.*
+
+# Env & local
+.env
+.DS_Store
