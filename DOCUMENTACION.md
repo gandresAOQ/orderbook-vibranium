@@ -337,7 +337,31 @@ Sembrar wallet (`POST /wallets`):
 
 ## 7. Cómo ejecutar
 
-Requisitos: **Docker** (para el stack completo) o **Go 1.26+** (para correrlo pelado).
+### Requisitos
+
+Para el **stack completo**, que es el único requisito duro:
+
+| Herramienta | Versión | Para qué |
+|---|---|---|
+| Docker + Compose v2 | Docker 20.10+ | Corre todo: app, Redpanda, Postgres, Redis |
+
+No hace falta nada más: el binario se compila dentro de la imagen.
+
+Para correrlo **pelado**, o para los tests y la prueba de carga:
+
+| Herramienta | Versión | Para qué |
+|---|---|---|
+| Go | **1.26+** (ver `go.mod`) | `make run`, `make test`, `make loadtest` |
+| `curl` | cualquiera | Los ejemplos de API |
+| `python3` | 3.x | Solo para `make replay-test`, que suma los saldos |
+
+**Puertos que deben estar libres:** `3000` (API), `5432` (Postgres), `6379`
+(Redis), `19092` (Redpanda), `8080` (Console). Si alguno está ocupado, liberalo o
+cambiá el mapeo en `docker-compose.yml`.
+
+**Recursos:** el stack entra cómodo en ~2 GB de RAM. Postgres y Redpanda guardan
+sus datos en volúmenes de Docker, así que el estado sobrevive a `make down`; usá
+`make reset` para borrarlo.
 
 ### Arquitectura completa — un solo comando
 
@@ -345,7 +369,7 @@ Requisitos: **Docker** (para el stack completo) o **Go 1.26+** (para correrlo pe
 make up          # docker compose up --build -d, espera a que esté healthy
 ```
 
-Levanta cuatro servicios y aplica el esquema de base de datos automáticamente
+Levanta **cinco** servicios y aplica el esquema de base de datos automáticamente
 (es idempotente, no hay contenedor de migraciones que correr):
 
 | Servicio | Rol | Puerto |
@@ -464,15 +488,20 @@ Qué hace, paso a paso:
 3. Espera a que **settlement** drene y **verifica el invariante**: el total de
    COP y de Vibranium debe ser idéntico al inicial.
 
-Salida esperada (ejemplo):
+Salida de una corrida real contra el stack completo:
 
 ```
-placed=10000 failed=0 in 1.2s (8300 orders/sec)
-INVARIANT: totalCOP=... (expected ...) totalVibranium=... (expected ...) stillLocked=0
-RESULT: OK — value conserved, no money created or destroyed
+placed=10000 failed=0 in 700ms (14277 orders/sec, ~7138 trades/sec)
+settlement drained: 5000/5000 trades
+INVARIANT: totalCOP=500000 (expected 500000) totalVibranium=5000 (expected 5000) stillLocked=0
+RESULT: OK — value conserved, every order matched and settled
 ```
 
 Si ves `RESULT: OK` y `stillLocked=0`, todo casó y el dinero cuadra.
+
+> El invariante se compara contra un **baseline medido** después del sembrado, no
+> contra un total teórico. Así el chequeo sigue siendo válido aunque la base ya
+> tuviera wallets de una corrida anterior.
 
 > Nota sobre la escala: el enunciado pide 5000 **trades**/s. Como cada trade
 > requiere dos órdenes que crucen, eso equivale a ~10.000 órdenes/s. El load test
@@ -643,15 +672,69 @@ Estos son comportamientos **verificados** del stack corriendo, no intenciones:
 - **Siguiente cuello de botella:** los round trips por evento de settlement a
   Postgres. Batchear (o usar una transacción unit-of-work por trade) es la
   siguiente optimización natural.
-- **En producción gestionada:** Redpanda → MSK/Confluent, Postgres → Aurora,
-  Redis → ElastiCache. Son cambios de URL, no de código: los adaptadores ya
-  hablan los protocolos estándar.
+- **En producción gestionada:** Redpanda → MSK, Postgres → Aurora, Redis →
+  ElastiCache. Son cambios de URL, no de código: los adaptadores ya hablan los
+  protocolos estándar. El diagrama de la arquitectura objetivo en AWS, con el
+  mapeo componente por componente, está en el
+  [README (*Future AWS deployment*)](README.md#future-aws-deployment).
+
+> **El cambio estructural que exige la nube:** hoy la API y el motor viven en el
+> **mismo proceso**. Si escalaras la API a tres tareas, cada una tendría su
+> **propia copia** del libro de VIB y tendrías tres libros divergentes para un
+> mismo instrumento. En AWS el binario se parte en dos: una capa de API sin estado
+> con N réplicas, y una capa de matching con **exactamente una tarea por símbolo**.
+> El detalle y las dos formas de conectarlas están en el README.
 
 ---
 
 ## 11. Observabilidad
 
-Lo que hay hoy:
+### Cómo ver los logs
+
+```bash
+make logs                                    # sigue el contenedor de la app
+docker compose logs -f postgres              # una dependencia puntual
+docker compose logs -f                       # todo, entrelazado
+docker compose logs --tail 50 orderbook      # ultimas 50 lineas
+docker compose logs --since 5m orderbook     # ultimos 5 minutos
+```
+
+La línea más útil es la del arranque: dice con qué adaptadores está corriendo.
+
+```bash
+docker compose logs orderbook | grep "orderbook listening"
+```
+
+Para más detalle, `LOG_LEVEL` acepta `debug`, `info` (default), `warn`, `error`.
+Con `debug` aparece una línea de acceso por request HTTP y se reportan los eventos
+duplicados que el journal descarta:
+
+```bash
+LOG_LEVEL=debug docker compose up -d orderbook
+LOG_LEVEL=debug make run
+```
+
+Como la salida es JSON, `jq` sirve directo:
+
+```bash
+docker compose logs --no-log-prefix orderbook | jq -r 'select(.level=="ERROR")'
+docker compose logs --no-log-prefix orderbook | jq -r '[.time,.level,.msg]|@tsv'
+```
+
+Errores que conviene reconocer: `settle buy failed` / `settle sell failed`
+significan que settlement no pudo aplicar un trade (se violó un invariante de
+reserva aguas arriba), y `wallet store unavailable` significa que la API está
+fallando cerrado porque Postgres no responde.
+
+Más allá de los logs:
+
+```bash
+make groups   # lag del consumer group de settlement
+make topic    # detalle del topic del event log
+make psql     # shell de psql
+```
+
+### Lo que hay hoy
 
 - **Logs estructurados en JSON** vía `slog`, incluyendo una línea al arrancar con
   los adaptadores seleccionados (útil para saber en qué modo está corriendo).

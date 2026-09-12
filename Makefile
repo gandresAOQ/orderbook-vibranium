@@ -1,6 +1,6 @@
 .PHONY: build run test vet fmt tidy loadtest clean \
         up down logs ps reset psql topic groups replay-test \
-        up-memory down-memory
+        up-memory down-memory diagram
 
 # ---------- local (no infrastructure) ----------
 
@@ -57,6 +57,19 @@ down-memory:
 
 loadtest: ## 5000 pairs, then reconcile balances
 	go run ./scripts/loadtest -pairs 5000 -concurrency 200
+
+# ---------- architecture diagram ----------
+
+# Regenerates docs/architecture/aws-architecture.png from the Python source,
+# using the official AWS Architecture Icons bundled with the `diagrams` package.
+# Requires graphviz on the PATH: brew install graphviz
+DIAGRAM_VENV := .venv-diagrams
+
+diagram: ## regenerate the AWS architecture diagram
+	@command -v dot >/dev/null 2>&1 || { echo "graphviz missing: brew install graphviz"; exit 1; }
+	@test -d $(DIAGRAM_VENV) || python3 -m venv $(DIAGRAM_VENV)
+	@$(DIAGRAM_VENV)/bin/pip install --quiet diagrams
+	@$(DIAGRAM_VENV)/bin/python docs/architecture/aws_architecture.py
 
 # ---------- inspection helpers (for the demo) ----------
 

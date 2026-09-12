@@ -93,17 +93,47 @@ constant across all users. The concurrency test and the load-test both assert it
 
 ---
 
+## Requirements
+
+**To run the full stack (recommended)** — this is the only hard requirement:
+
+| Tool | Version | Why |
+|---|---|---|
+| Docker + Compose v2 | Docker 20.10+, Compose v2 | Runs everything: app, Redpanda, Postgres, Redis |
+
+Nothing else is needed: the Go toolchain is not required because the binary is
+compiled inside the image.
+
+**To run it bare, or to run the tests and the load test:**
+
+| Tool | Version | Why |
+|---|---|---|
+| Go | **1.26+** (see `go.mod`) | `make run`, `make test`, `make loadtest` |
+| `curl` | any | The API examples below |
+| `python3` | 3.x | Only for `make replay-test`, which computes balance totals |
+
+**Ports that must be free:** `3000` (API), `5432` (Postgres), `6379` (Redis),
+`19092` (Redpanda), `8080` (Redpanda Console). If one is taken, either stop the
+process using it or change the mapping in `docker-compose.yml`.
+
+**Resources:** the stack fits comfortably in ~2 GB of RAM. Postgres and Redpanda
+keep their data in named Docker volumes, so state survives `make down`; use
+`make reset` to wipe it.
+
+---
+
 ## Run it
 
-Requirements: Docker (for the full stack) or Go 1.26+ (to run it bare).
-
-### Full architecture — one command
+### Option A — full architecture, one command
 
 ```bash
-make up          # docker compose up --build -d, waits until healthy
+make up
 ```
 
-That starts four services and applies the DB schema automatically:
+That's it. It builds the image, starts **five** services, waits until the API is
+healthy, and applies the database schema automatically (the schema is embedded in
+the binary and applied idempotently at boot, so there is no migration step to
+run).
 
 | Service | Role | Port |
 |---|---|---|
@@ -113,28 +143,141 @@ That starts four services and applies the DB schema automatically:
 | `redis` | hot read cache for wallet lookups | 6379 |
 | `console` | web UI to inspect the event log (optional) | 8080 |
 
+Verify it came up:
+
 ```bash
-make logs        # follow the app
+curl -s localhost:3000/health
+# {"status":"ok","symbol":"VIB","trades":0}
+```
+
+Lifecycle:
+
+```bash
 make ps          # service health
-make down        # stop, keep data
-make reset       # stop and wipe volumes
+make down        # stop, keep the data volumes
+make reset       # stop AND wipe all data (fresh start)
 ```
 
-### Zero infrastructure
+First `make up` pulls images and compiles, so expect a minute or two. Afterwards
+it takes about 20 seconds.
 
-Same binary, all adapters set to `memory`:
+### Option B — zero infrastructure
+
+The same binary with every adapter set to `memory`. Useful to see the API working
+with nothing else installed:
 
 ```bash
-make run         # bare process on :3000
-make up-memory   # single container, no dependencies
+make run         # bare Go process on :3000 (needs Go 1.26+)
+make up-memory   # single container, no dependencies (needs only Docker)
+make down-memory # stop it
 ```
 
-### Test
+The startup log line tells you which mode you are in — see
+[Viewing logs](#viewing-logs).
+
+---
+
+## Viewing logs
+
+The app emits **structured JSON logs** via `slog` on stdout.
+
+### Follow the application
 
 ```bash
-make test        # go test ./... -race
-make loadtest    # 5000 pairs, then reconciles balances
+make logs                        # follows the orderbook container
+docker compose logs -f orderbook # same thing, directly
 ```
+
+### Confirm which adapters are wired
+
+The most useful single line. It is printed once at startup and tells you whether
+you are running on real infrastructure or in memory:
+
+```bash
+docker compose logs orderbook | grep "orderbook listening"
+```
+
+```json
+{"time":"...","level":"INFO","msg":"orderbook listening","addr":"0.0.0.0:3000",
+ "symbol":"VIB","adapters":{"cache":"redis","eventLog":"kafka:orderbook.events",
+ "journal":"postgres","orders":"postgres","trades":"postgres","wallets":"postgres"}}
+```
+
+In memory mode every value reads `memory` / `none` instead.
+
+### Other services
+
+```bash
+docker compose logs -f postgres
+docker compose logs -f redpanda
+docker compose logs -f redis
+docker compose logs -f            # everything, interleaved
+docker compose logs --tail 50 orderbook
+docker compose logs --since 5m orderbook
+```
+
+### Turn up the detail
+
+`LOG_LEVEL` accepts `debug`, `info` (default), `warn`, `error`. `debug` adds an
+access log line per HTTP request and reports skipped duplicate events:
+
+```bash
+LOG_LEVEL=debug docker compose up -d orderbook
+```
+
+For `make run`, just prefix it: `LOG_LEVEL=debug make run`.
+
+### Filtering
+
+Because the output is JSON, `jq` works well:
+
+```bash
+docker compose logs --no-log-prefix orderbook | jq -r 'select(.level=="ERROR")'
+docker compose logs --no-log-prefix orderbook | jq -r '[.time,.level,.msg]|@tsv'
+```
+
+Errors worth knowing: `settle buy failed` / `settle sell failed` mean settlement
+could not apply a trade (a reservation invariant was violated upstream), and
+`wallet store unavailable` means the API is failing closed because Postgres is
+unreachable.
+
+### Beyond logs
+
+```bash
+make groups   # settlement consumer lag on the event log
+make topic    # event log topic details
+make psql     # psql shell (SELECT * FROM trades; etc.)
+```
+
+Redpanda Console at <http://localhost:8080> shows the raw event stream — every
+trade and order update, in order, with its unique ID. It is the clearest way to
+demonstrate traceability.
+
+---
+
+## Testing
+
+```bash
+make test       # unit + integration tests, with the race detector
+make vet        # go vet
+make loadtest   # 5000 buyer/seller pairs, then reconciles balances
+```
+
+`make loadtest` is the one that mirrors how the challenge is evaluated: it seeds
+5000 buyers and 5000 sellers, fires all 10 000 orders concurrently, waits for
+settlement to drain, then proves that no value was created or destroyed. It needs
+the API running (`make up` or `make run`) in another shell. A real run:
+
+```
+placed=10000 failed=0 in 700ms (14277 orders/sec, ~7138 trades/sec)
+settlement drained: 5000/5000 trades
+INVARIANT: totalCOP=500000 (expected 500000) totalVibranium=5000 (expected 5000) stillLocked=0
+RESULT: OK — value conserved, every order matched and settled
+```
+
+Resilience checks are documented under [Failure modes](#failure-modes-what-happens-when-a-component-fails),
+including `make replay-test`, which rewinds the event log and proves money is not
+duplicated.
 
 ## API
 
@@ -166,18 +309,6 @@ curl -s localhost:3000/trades
 curl -s localhost:3000/wallets/alice   # +50 Vibranium, -5000 COP
 curl -s localhost:3000/wallets/bob     # -50 Vibranium, +5000 COP
 ```
-
-## Load test (validates balances, like the evaluation)
-
-```bash
-make run &                                    # in one shell
-go run ./scripts/loadtest -pairs 5000 -concurrency 200
-```
-
-It seeds 5000 buyer/seller pairs, fires all orders concurrently, prints the
-throughput, then reconciles: total COP and total Vibranium must be unchanged.
-
----
 
 ## Failure modes (what happens when a component fails)
 
@@ -220,14 +351,119 @@ deliberately out of MVP scope.
   reservations take a **row-level lock in Postgres** rather than an in-process
   mutex, the no-double-spend guarantee survives multiple API replicas.
 - **One asset (Vibranium)**: a single partition and one engine already exceed the
-  target — measured **~14,900 orders/sec (~7,400 trades/sec)** on a laptop
-  against the full Redpanda+Postgres+Redis stack, with the money invariant
-  holding.
+  target — measured **~14,000–14,900 orders/sec (~7,000–7,400 trades/sec)** across
+  runs on a laptop against the full Redpanda+Postgres+Redis stack, with the money
+  invariant holding every time.
 - **More assets**: shard by **symbol** across partitions/engines — linear scaling
   per instrument. A single hot symbol is the hard ceiling; you cannot parallelize
   one book. That is a property of order books, not a flaw here.
-- **Next bottleneck** is settlement's per-event round trips to Postgres, which
-  batching (or a per-trade unit-of-work transaction) would relieve.
+- **Next bottleneck is settlement, and it is measured**: matching absorbs ~14k
+  orders/sec but settlement applies only **~507 trades/sec**, because it issues
+  roughly **14 Postgres transactions per trade** (journal insert, two wallet
+  transactions with `SELECT … FOR UPDATE`, trade insert, plus the order-projection
+  updates). The buffered log absorbs the burst, so a 5000-trade run shows a few
+  seconds of settlement lag rather than failures. The fix is **micro-batching**
+  (many events per transaction), not parallelism: because funds are reserved
+  up front, settlements are commutative, but batching preserves ordering and
+  gives atomicity for free — it also closes the non-atomic two-leg gap noted
+  below. Deliberately left out of the MVP to keep the code simple.
+
+### Known gaps, stated plainly
+
+Three things I found by probing the running system and chose not to fix, to keep
+the MVP small. They are listed here rather than hidden because knowing about them
+is more valuable than a clean-looking README:
+
+1. **`int64` overflow in the reservation.** `ReservedCOP()` computes
+   `Price * Quantity` unguarded, so an order with `price = quantity = 2^32` wraps
+   to a reservation of `0` and is accepted with no collateral. Fix: validate that
+   the product does not overflow, ideally alongside configurable max price/size
+   (a market-sanity band).
+2. **A trade's two legs are not atomic.** The buyer and seller updates are
+   separate transactions, so if the buyer's leg fails the seller's still applies —
+   which credits COP that was never debited. The micro-batching change above
+   fixes this as a side effect.
+3. **`POST /wallets` overwrites locked funds.** It is an upsert that resets
+   `locked` to zero, so re-seeding a user who has resting orders leaves those
+   orders in the book with no collateral behind them. Fix: reject the re-seed with
+   `409` when locked funds exist, or make seeding additive.
+
+## Future AWS deployment
+
+The local stack was chosen so that every piece has a managed AWS equivalent: the
+adapters already speak the standard protocols (Kafka, PostgreSQL, Redis), so
+moving to the cloud is a change of connection strings, not of code.
+
+> This is a **proposed** target architecture, not something deployed — the MVP
+> runs locally. Click the image for full resolution.
+
+![Proposed AWS target architecture](docs/architecture/aws-architecture.png)
+
+Read it left to right: clients enter through the edge, the API tier reserves funds
+against Aurora, the matching tier emits events to MSK, and settlement consumes
+them and is the only component writing credits and debits. Edge colours separate
+the concerns — **red** is the money path, **blue** is the ordered event log, grey
+is plain request flow and supporting traffic.
+
+The diagram is generated from
+[`docs/architecture/aws_architecture.py`](docs/architecture/aws_architecture.py)
+using the official AWS Architecture Icons, so it stays reviewable as code:
+
+```bash
+make diagram    # needs graphviz + the diagrams package (see the target)
+```
+
+### Component mapping
+
+| Local | AWS | Notes |
+|---|---|---|
+| Redpanda | **Amazon MSK** (or MSK Serverless) | Kafka-compatible, so `kafkalog` works unchanged. One partition per symbol preserves per-book ordering |
+| Postgres | **Aurora PostgreSQL** Multi-AZ | `SELECT … FOR UPDATE` semantics are identical; a reader endpoint can serve `GET /wallets` reconciliation |
+| Redis | **ElastiCache for Redis** | Same client, same decorator |
+| `docker compose` | **ECS on Fargate** | No servers to manage; EC2 is worth considering for the matching tier if you need tighter tail latency |
+| container image | **ECR** | The existing distroless image is already tiny and non-root |
+| `slog` to stdout | **CloudWatch Logs** | JSON logs are queryable as-is with Logs Insights |
+| — | **Secrets Manager** | Replaces the plaintext `DATABASE_URL` in compose |
+| — | **S3 + Glue + Athena** | Long-term trade archive for the traceability requirement |
+| — | **SQS** | Dead letter for events settlement cannot apply |
+
+### The one thing that must change: split the binary
+
+Today the API and the matching engine live in the **same process** and talk over a
+Go channel. That is what makes the local setup a single container, but it does not
+survive horizontal scaling: if you ran three API tasks, each would own its **own
+copy** of the VIB book, and you would have three divergent order books for one
+instrument. Correctness would be gone.
+
+So in AWS the deployable splits in two:
+
+- **API tier** — stateless, any number of tasks. It validates, reserves funds
+  against Aurora (the row lock is what keeps double-spend impossible across
+  replicas), and forwards the order.
+- **Matching tier** — **exactly one task per symbol.** Not an autoscaling group: a
+  singleton, because a single book cannot be parallelized.
+
+Two ways to connect them, with a real trade-off:
+
+| Approach | How | Cost |
+|---|---|---|
+| **Synchronous** | API calls the engine over gRPC/HTTP; engine stays a singleton service | Keeps today's API contract (`201` with the fill result). Adds a network hop and makes the engine a SPOF that needs a hot standby |
+| **Log-based** | API publishes to an `orders` topic; the engine consumes it | More resilient and uniform with the rest of the design. But placement becomes asynchronous: the API returns `202 Accepted` and clients poll `GET /orders/{id}` or subscribe to updates |
+
+I would take the log-based route for production, because it makes the ordered log
+the single source of truth for both input and output, which is what allows a
+standby engine to take over by replaying.
+
+### Prerequisite before any of this ships
+
+Engine failover depends on **rebuilding the book from the log**, and that routine
+is the [known limitation](#failure-modes-what-happens-when-a-component-fails) of
+this MVP. Everything needed is already in place — a durable ordered log, unique
+event IDs, an idempotency journal — but the replay-and-snapshot logic itself is
+not written. It is the first thing to build before a cloud deployment, because
+without it a matching-tier restart loses every resting order.
+
+---
 
 ## Observability
 

@@ -15,3 +15,8 @@ coverage.*
 # Env & local
 .env
 .DS_Store
+
+# Virtualenv used only to regenerate the architecture diagram (`make diagram`).
+# The generated PNG IS committed; the toolchain to rebuild it is not.
+.venv-diagrams/
+__pycache__/
