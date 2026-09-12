@@ -304,3 +304,29 @@ behaviour when the database is down.
 auth/registration, market orders, and **rebuilding the book by replaying the log
 on startup** (plus snapshots) — the known limitation described under Failure
 modes.
+
+---
+
+## References / prior art
+
+Implementations and articles reviewed while researching the problem. Listed with
+what each contributes and where it differs from the choices made here — the
+contrast is what justifies the design. See
+[DOCUMENTACION.md §13](DOCUMENTACION.md#13-referencias-y-estado-del-arte) for the
+detailed comparison.
+
+*Content paraphrased from the linked sources; original code and full detail live at each link.*
+
+| Source | Contributes | Differs from this project |
+|---|---|---|
+| [i25959341/orderbook](https://github.com/i25959341/orderbook) | Most complete Go matching engine: price-time priority, limit + market orders, >300k trades/sec | Uses `shopspring/decimal`; here money is exact `int64`. Book only — no wallets or settlement |
+| [danielgatis/go-orderbook](https://github.com/danielgatis/go-orderbook) | HFT limit order book following WK Selph's data-structure write-up; exposes aggregated `Depth()` | Book only; no money path |
+| [ricardohsd/order-book](https://github.com/ricardohsd/order-book) | Minimal limit order book for crypto exchanges | Author notes it is a pet project, not production-used |
+| [bhomnick — Building an exchange limit order book in Go](https://bhomnick.net/building-a-simple-limit-order-in-go/) | Price-indexed pre-allocated array + per-level linked lists for O(1) ops; lazy cancellation; 350k–2M actions/sec | That array caps the price range and costs memory proportional to it; here a map + sorted slice trades O(1) for O(log n) with no price ceiling. **Its "next steps" describe this project's architecture**: a Kafka-style log to rebuild the book after a crash, and settlement decoupled from the engine |
+| [Aditya Raj — Market Depth Simplified](https://medium.com/@adityaraj_201551/market-depth-simplified-building-an-order-book-engine-in-go-9abb9bcaec9a) + [repo](https://github.com/aditya201551/in-memory-order-book-go) | Why a **B-tree** suits price levels: sorted keys plus efficient range queries as the best price ticks | Uses `float64` for money, which accumulates rounding error — the reason this project uses integers. B-tree is the natural next step here if price levels grow |
+| [Majid Imanzade — Order Book Processing with Go's Pipeline Pattern](https://medium.com/@majidimanzade1/building-efficient-order-book-processing-with-gos-pipeline-pattern-10b5e752029a) | Channel-connected pipeline stages, each returning a channel, with fan-out inside I/O-heavy stages | Pipelines the **building of depth snapshots**, not matching. A read projection parallelizes freely; an order book needs a total order, which is why matching stays single-goroutine here |
+
+**What none of them cover:** the money. No wallets, no available/locked split, no
+credits and debits on execution, no decoupled settlement. That is the core of the
+challenge and lives here in `core/domain/wallet.go` and
+`core/service/settlement.go`.

@@ -696,3 +696,94 @@ Regla de dependencias: todo apunta **hacia adentro**. `adapter/*` depende de
 `core/port` y `core/domain`; `core/service` depende de `core/port` y
 `core/domain`; `core/domain` no depende de nadie. El núcleo no conoce HTTP,
 canales ni almacenamiento concretos.
+
+---
+
+## 13. Referencias y estado del arte
+
+Estas son las implementaciones y artículos que se revisaron al investigar el
+problema. Se listan con lo que aporta cada una y, sobre todo, en qué se
+diferencian de las decisiones de este proyecto: el contraste es lo que justifica
+por qué acá se eligió otra cosa.
+
+> Contenido parafraseado a partir de las fuentes enlazadas; los detalles y el
+> código original están en cada enlace.
+
+### Implementaciones de order book en Go
+
+**[i25959341/orderbook](https://github.com/i25959341/orderbook)** — *Matching
+Engine for Limit Order Book in Golang* (MIT).
+La referencia más completa del ecosistema Go. Implementa prioridad precio-tiempo,
+órdenes límite y de mercado, cancelación, y reporta más de 300.000 trades por
+segundo. Su API (`ProcessLimitOrder`, `ProcessMarketOrder`, `CancelOrder`) documenta
+con diagramas los casos de fill total, parcial y remanente en reposo.
+*Diferencia:* usa `shopspring/decimal` para precios y cantidades; acá se optó por
+`int64` exacto, aceptando la pérdida de fracciones a cambio de aritmética sin
+asignaciones ni redondeo en el hot path. También es solo el libro: no modela
+billeteras ni liquidación.
+
+**[danielgatis/go-orderbook](https://github.com/danielgatis/go-orderbook)** —
+libro de órdenes límite para HFT (MIT), basado en el clásico artículo de WK Selph
+sobre estructuras de datos para order books. Expone `Depth()` para la profundidad
+agregada, igual que el `Snapshot()` de este proyecto.
+
+**[ricardohsd/order-book](https://github.com/ricardohsd/order-book)** — librería
+Go de libro de órdenes límite para exchanges de cripto. El propio autor advierte
+que es un proyecto personal no usado en producción. Útil como implementación
+mínima de contraste.
+
+**[bhomnick — Building an exchange limit order book in Go](https://bhomnick.net/building-a-simple-limit-order-in-go/)**
+— el más interesante desde el punto de vista de diseño.
+Usa un **arreglo preasignado indexado por precio** (`prices [MAX_PRICE]*PricePoint`)
+con listas enlazadas por nivel, logrando inserción, cancelación y fill en O(1).
+La cancelación es *lazy*: pone la cantidad en cero y la ignora al recorrer, en vez
+de sacar la orden de la estructura. Reporta entre 350.000 y 2 millones de
+acciones/segundo.
+*Diferencia:* ese arreglo obliga a acotar el rango de precios de antemano y
+consume memoria proporcional a ese rango, no a las órdenes vivas. Acá se usa
+`map[int64]*priceLevel` más un slice de precios ordenado con búsqueda binaria:
+O(log n) para insertar un nivel nuevo en lugar de O(1), pero sin techo de precio
+y con memoria proporcional a los niveles realmente ocupados.
+*Coincidencia notable:* la sección "next steps" del artículo propone exactamente
+la arquitectura que este proyecto implementa — escribir las acciones a un log tipo
+Kafka para poder reconstruir el libro tras una caída, y desacoplar la liquidación
+del motor de matching. Es una validación independiente del diseño.
+
+### Estructuras de datos para niveles de precio
+
+**[Aditya Raj — Market Depth Simplified: Building an Order Book Engine in Go](https://medium.com/@adityaraj_201551/market-depth-simplified-building-an-order-book-engine-in-go-9abb9bcaec9a)**
+(nov 2024) y su repo
+**[aditya201551/in-memory-order-book-go](https://github.com/aditya201551/in-memory-order-book-go)**.
+Explica por qué un **B-tree** (vía `google/btree`) encaja bien con un libro de
+órdenes: mantiene los precios ordenados y permite consultas por rango eficientes,
+que es justo lo que se necesita cuando el mejor precio cambia en cada tick.
+*Diferencia:* el artículo usa `float64` para precios y cantidades. Para dinero eso
+introduce error de redondeo acumulativo, y es precisamente lo que este proyecto
+evita con enteros (ver la nota de representación en `core/domain/order.go`). La
+elección de B-tree sí sería el próximo paso natural acá si el número de niveles de
+precio creciera mucho: reemplazaría el slice ordenado sin tocar el resto del motor.
+
+### El patrón pipeline
+
+**[Majid Imanzade — Building Efficient Order Book Processing with Go's Pipeline Pattern](https://medium.com/@majidimanzade1/building-efficient-order-book-processing-with-gos-pipeline-pattern-10b5e752029a)**
+(dic 2025).
+Construye un pipeline de etapas conectadas por canales, donde cada etapa devuelve
+un canal que consume la siguiente: filtrar pares válidos → enriquecer con órdenes
+pendientes → ordenar y recortar → publicar. Usa fan-out con `WaitGroup` dentro de
+las etapas pesadas de I/O.
+*Diferencia importante de alcance:* ese pipeline **arma y publica snapshots de
+profundidad**, no ejecuta el matching. Son problemas distintos: una proyección de
+lectura sí se puede paralelizar libremente, mientras que un libro de órdenes exige
+un orden total y por eso acá el matching vive en una sola goroutine.
+El pipeline de este proyecto es
+`API → [canal] → motor → [event log] → settlement → stores`, y su etapa lenta es
+settlement, no el matching (ver sección 10, *Escalabilidad*).
+
+### Qué no cubre ninguna de estas referencias
+
+Todas resuelven el **libro de órdenes**; ninguna modela el **dinero**. No hay
+billeteras, ni saldo disponible frente a reservado, ni créditos y débitos al
+ejecutarse una operación, ni liquidación desacoplada. Ese es justamente el centro
+del desafío ("que efectúe los créditos y débitos correctamente"), y es la parte
+que en este proyecto vive en `core/domain/wallet.go` y `core/service/settlement.go`
+bajo el modelo reservar / liquidar / liberar de la sección 5.
