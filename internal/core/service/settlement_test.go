@@ -10,6 +10,7 @@ import (
 	"github.com/meli/orderbook/internal/adapter/driven/matching"
 	"github.com/meli/orderbook/internal/adapter/driven/memlog"
 	"github.com/meli/orderbook/internal/adapter/driven/memstore"
+	"github.com/meli/orderbook/internal/adapter/driven/telemetry"
 	"github.com/meli/orderbook/internal/core/domain"
 	"github.com/meli/orderbook/internal/core/port"
 	"github.com/meli/orderbook/internal/core/service"
@@ -34,8 +35,9 @@ func newHarness(t *testing.T) *harness {
 	trades := memstore.NewTradeStore()
 	orders := memstore.NewOrderStore()
 	eng := matching.NewEngine("VIB", log, 1<<16)
-	trading := service.NewTrading("VIB", eng, wallets, orders)
-	settler := service.NewSettlement(log, memstore.NewJournal(), wallets, trades, orders, nil)
+	metrics := telemetry.NewNoop()
+	trading := service.NewTrading("VIB", eng, wallets, orders, metrics)
+	settler := service.NewSettlement(log, memstore.NewJournal(), wallets, trades, orders, metrics, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go eng.Run(ctx)

@@ -141,6 +141,8 @@ run).
 | `redpanda` | durable ordered event log (Kafka API) | 19092 |
 | `postgres` | wallets, trades, orders, settlement journal | 5432 |
 | `redis` | hot read cache for wallet lookups | 6379 |
+| `prometheus` | scrapes `/metrics`, evaluates the alert rules | 9090 |
+| `jaeger` | receives traces over OTLP | 16686 |
 | `console` | web UI to inspect the event log (optional) | 8080 |
 
 Verify it came up:
@@ -465,16 +467,64 @@ without it a matching-tier restart loses every resting order.
 
 ---
 
-## Observability
+## Observability (OpenTelemetry)
 
-Structured JSON logs via `slog`, including the selected adapters at startup.
-`/health` surfaces dependency failure instead of lying `ok`. Redpanda Console
-(`:8080`) shows the raw event log for traceability demos, and `make groups` shows
-settlement consumer lag.
+Structured JSON logs via `slog`, plus **OpenTelemetry** metrics and traces. What
+makes it useful is that the metrics are *domain* metrics, not CPU graphs: whether
+money is conserved, whether settlement is keeping up, and why orders are refused.
 
-Metrics to add next: orders/sec, match latency, book depth, log lag, settlement
-latency, and a periodic **reconciliation job** that proves the money invariant in
-production.
+**Metrics live behind a port.** `port.Metrics` speaks business language
+(`OrderPlaced`, `TradeExecuted`, `SettlementApplied`, `MoneySupply`), so the core
+never imports a vendor SDK — same discipline as HTTP and SQL. It also puts metric
+naming and **label cardinality** in one place, which is what stops a system doing
+thousands of ops/sec from exploding a time-series database: no `orderId` or
+`userId` labels anywhere. `adapter/driven/telemetry` provides the OTel
+implementation and a no-op, so instrumentation call sites need no `if enabled`.
+
+**Telemetry fails open**, unlike everything else. If it cannot initialise, the
+error is logged and the service starts blind. Postgres and Redpanda fail *closed*
+because they hold the money; observability must never be the reason an exchange
+cannot trade.
+
+| Metric | Type | Why it matters |
+|---|---|---|
+| `orderbook_orders_total{side,status}` | counter | The status breakdown tells the story: in the load test SELLs rest `OPEN` and BUYs come back `FILLED` |
+| `orderbook_orders_rejected_total{reason}` | counter | `insufficient_funds`, `validation`, `wallet_not_found`, `wallet_store_unavailable`, `engine_unavailable` |
+| `orderbook_order_accept_duration_milliseconds` | histogram | Latency of the whole accept path — what the client actually waits on |
+| `orderbook_trades_total` / `_traded_quantity_total` / `_traded_notional_total` | counter | Executed volume and value |
+| `orderbook_settlement_events_total` / `_failures_total` | counter | Settlement throughput and failures |
+| `orderbook_settlement_lag_milliseconds` | histogram | **Pipeline health.** Measured from when the engine stamped the event, so it covers the whole async hop |
+| `orderbook_supply_cop`, `orderbook_supply_vibranium` | gauge | **Must be flat lines.** Any movement means value was created or destroyed |
+
+Those last two turn the load test's end-of-run assertion into a *continuous* one.
+A `Reconciliation` job samples every wallet every `RECONCILE_INTERVAL` and reports
+the totals. It only reads, so it can never cause a discrepancy.
+
+**Alert rules** (`deploy/rules.yml`) map to the failure modes above rather than to
+generic noise. The sharpest is `MoneyDestroyed`: it watches for the supply going
+*down*, because seeding a wallet is a deposit and can only raise it — a drop is the
+exact signature of a half-applied trade.
+
+**Traces** go over OTLP to Jaeger. Spans are named by route pattern
+(`DELETE /orders/{id}`, never one name per order ID) and `/metrics` and `/health`
+are filtered out so scrapes do not generate spans.
+
+| Where to look | URL |
+|---|---|
+| Raw metrics | <http://localhost:3000/metrics> |
+| Prometheus + alerts | <http://localhost:9090> |
+| Traces | <http://localhost:16686> |
+| Raw event log | <http://localhost:8080> |
+
+Shortcuts: `make metrics`, `make alerts`, `make groups`.
+
+Measured on a 500-pair run against the full stack: `orderbook_supply_cop 50000`
+and `orderbook_supply_vibranium 500` (identical to what was seeded), ~810 ms mean
+settlement lag per `TRADE`, 400 traces in Jaeger.
+
+Still open: correlating logs with trace IDs, book depth/spread gauges, and
+propagating trace context through the event log so a request and its asynchronous
+settlement appear in one trace.
 
 ## Project layout (hexagonal / ports & adapters)
 

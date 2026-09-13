@@ -378,6 +378,8 @@ Levanta **cinco** servicios y aplica el esquema de base de datos automáticament
 | `redpanda` | log de eventos ordenado y durable (API Kafka) | 19092 |
 | `postgres` | wallets, trades, orders, journal de settlement | 5432 |
 | `redis` | caché de lectura de wallets | 6379 |
+| `prometheus` | scrapea `/metrics` y evalúa las reglas de alerta | 9090 |
+| `jaeger` | recibe trazas vía OTLP | 16686 |
 | `console` | UI web para inspeccionar el event log (opcional) | 8080 |
 
 ### Sin infraestructura
@@ -734,20 +736,148 @@ make topic    # detalle del topic del event log
 make psql     # shell de psql
 ```
 
-### Lo que hay hoy
+### Métricas y trazas con OpenTelemetry
 
-- **Logs estructurados en JSON** vía `slog`, incluyendo una línea al arrancar con
-  los adaptadores seleccionados (útil para saber en qué modo está corriendo).
-- **`/health` refleja el estado de las dependencias**: si el trade store no
-  responde devuelve `503` con `status: degraded` en vez de mentir `ok`.
-- **Redpanda Console** en <http://localhost:8080> para ver el event log crudo:
-  cada trade y actualización de orden, en orden, con su ID único. Es la
-  trazabilidad hecha visible.
-- **`make groups`** muestra el lag del consumer group de settlement.
+Además de los logs, la observabilidad está construida con **OpenTelemetry**. Lo
+que la hace interesante no son las métricas de infraestructura (CPU, memoria)
+sino las **métricas de dominio**: si el dinero se conserva, si settlement va al
+día, por qué se rechazan órdenes.
 
-Siguiente paso natural: métricas (órdenes/s, latencia de match, profundidad del
-libro, lag del log, latencia de settlement) expuestas en `/metrics`, y un job
-periódico de **reconciliación** que pruebe el invariante del dinero en producción.
+#### Por qué un puerto y no llamar a OTel directamente
+
+`port.Metrics` (en `core/port/telemetry.go`) declara mediciones en el vocabulario
+del negocio, no en el de un SDK:
+
+```go
+type Metrics interface {
+    OrderPlaced(ctx, side, status, d)
+    OrderRejected(ctx, reason)
+    TradeExecuted(ctx, trade)
+    SettlementApplied(ctx, evType, lag, err)
+    MoneySupply(ctx, cop, vibranium)
+}
+```
+
+El núcleo dice "se colocó una orden", no "incrementá el contador
+`orderbook_orders_total`". Eso trae tres beneficios concretos:
+
+1. El núcleo sigue libre de SDKs de terceros, igual que está libre de HTTP y SQL.
+   Cambiar OpenTelemetry por otra cosa toca **un** adaptador.
+2. Los tests corren contra la implementación no-op, sin ninguna preparación.
+3. Los nombres de métricas y la **cardinalidad de las etiquetas** se deciden en un
+   solo lugar. Eso evita que un sistema de miles de operaciones por segundo haga
+   explotar una base de series temporales: no hay etiquetas con `orderId` ni
+   `userId`, solo `side`, `status`, `event.type`, `symbol` y una razón de rechazo
+   acotada.
+
+El adaptador vive en `adapter/driven/telemetry`, con dos implementaciones: la de
+OTel y un **no-op**. Como nunca es `nil`, los puntos de instrumentación en el
+núcleo quedan sin `if habilitado` ni chequeos de nulos.
+
+**Política de fallos, deliberadamente distinta al resto:** si la telemetría no
+puede inicializarse, se loguea el error y el servicio **arranca igual**, ciego. Es
+lo contrario a Postgres y Redpanda, donde el arranque falla cerrado. La razón es
+simple: la observabilidad no debe ser nunca el motivo por el que un exchange no
+puede operar; el dinero sí.
+
+#### Métricas expuestas
+
+En formato Prometheus en `GET /metrics` (modelo *pull*, sin collector en el
+camino: se inspecciona con `curl` en una demo).
+
+| Métrica | Tipo | Para qué sirve |
+|---|---|---|
+| `orderbook_orders_total{side,status}` | contador | Órdenes aceptadas. El desglose por estado cuenta la historia: en el load test los SELL quedan `OPEN` y los BUY `FILLED`. |
+| `orderbook_orders_rejected_total{reason}` | contador | Rechazos por razón: `insufficient_funds`, `validation`, `wallet_not_found`, `wallet_store_unavailable`, `engine_unavailable`. |
+| `orderbook_order_accept_duration_milliseconds` | histograma | Latencia del camino completo de aceptación (validar, reservar, casar). Es lo que el cliente realmente espera. |
+| `orderbook_trades_total` | contador | Trades ejecutados. |
+| `orderbook_traded_quantity_total` | contador | Unidades de Vibranium negociadas. |
+| `orderbook_traded_notional_total` | contador | Valor en COP intercambiado. |
+| `orderbook_settlement_events_total{event_type}` | contador | Eventos aplicados por settlement. |
+| `orderbook_settlement_failures_total{event_type}` | contador | Eventos que settlement no pudo aplicar. |
+| `orderbook_settlement_lag_milliseconds` | histograma | **El indicador de salud del pipeline.** Se mide desde que el motor estampó el evento, así que captura todo el salto asíncrono (transporte del log + encolado + aplicación). |
+| `orderbook_supply_cop` | gauge | Total de COP en todas las billeteras (`available + locked`). |
+| `orderbook_supply_vibranium` | gauge | Total de Vibranium. |
+
+Las dos últimas son las más importantes del sistema y se explican solas: **deben
+ser líneas planas**. Cualquier movimiento significa que se creó o destruyó valor.
+
+#### El invariante del dinero, vigilado de forma continua
+
+`core/service/reconciliation.go` es un job que cada `RECONCILE_INTERVAL` (10 s en
+el compose) lee todas las billeteras, suma los totales y los reporta a los gauges.
+Solo lee, así que nunca puede ser la causa de un descuadre.
+
+Esto convierte lo que la prueba de carga verifica **al final de un run** en algo
+verificado **de forma continua**, que es lo que realmente se quiere en producción:
+un error contable silencioso es mucho más peligroso que una caída ruidosa.
+
+Tiene una limitación que vale explicitar: es una lectura no transaccional, así que
+una muestra tomada en medio de una liquidación puede ver un descuadre transitorio.
+Por eso la regla de alerta usa `for: 1m` — solo un descuadre que **persiste** es
+un bug real.
+
+#### Trazas distribuidas
+
+El adaptador REST se envuelve con `otelhttp` cuando hay un endpoint OTLP
+configurado. Cada request se convierte en un span y se respeta el `traceparent`
+entrante (propagación W3C), así que una traza puede continuar entre procesos.
+
+Dos detalles de cardinalidad que importan:
+
+- Los spans se nombran por el **patrón de ruta**, no por el path crudo:
+  `DELETE /orders/{id}` y no un nombre distinto por cada ID de orden.
+- `/metrics` y `/health` están filtrados, para no generar un span por cada scrape.
+
+El muestreo es configurable (`OTEL_TRACES_SAMPLER_RATIO`). En el compose local
+está en `1.0` para que la demo siempre muestre algo; en producción sería un
+pequeño porcentaje.
+
+#### Reglas de alerta
+
+En `deploy/rules.yml`. Es la parte que conviene mostrar en la presentación, porque
+cada regla corresponde a un modo de fallo concreto de la sección 9, no a ruido
+genérico de CPU:
+
+| Alerta | Severidad | Qué detecta |
+|---|---|---|
+| `MoneyDestroyed` | critical | El suministro de dinero **bajó**. La asimetría la hace precisa: sembrar una billetera es un depósito y solo puede subirlo; nada en operación normal lo baja. Una caída es la firma exacta de un trade a medio aplicar. |
+| `SettlementFailures` | critical | Se ejecutaron trades que no pudieron aplicarse a las billeteras: el libro y el ledger divergieron. |
+| `SettlementLagHigh` | warning | p95 del lag > 5 s: settlement se está quedando atrás del motor. |
+| `OrderAcceptLatencyHigh` | warning | p99 de aceptación > 250 ms. |
+| `OrdersRejectedByInfrastructure` | critical | Se rechazan órdenes porque el wallet store está caído (el fail-closed en acción). |
+
+#### Cómo verlo
+
+Con `make up`:
+
+| Qué | Dónde |
+|---|---|
+| Métricas crudas | <http://localhost:3000/metrics> |
+| Prometheus (consultas y alertas) | <http://localhost:9090> |
+| Trazas | <http://localhost:16686> (Jaeger) |
+| Event log crudo | <http://localhost:8080> (Redpanda Console) |
+| Lag del consumer group | `make groups` |
+
+Atajos: `make metrics` imprime las métricas de dominio y `make alerts` muestra el
+estado de las reglas.
+
+Medición real de una corrida de 500 pares contra el stack completo: el gauge marcó
+`orderbook_supply_cop 50000` y `orderbook_supply_vibranium 500`, idénticos a lo
+sembrado; el lag promedio por evento `TRADE` fue de ~810 ms; Jaeger recibió 400
+trazas.
+
+#### Lo que queda pendiente
+
+- **Logs correlacionados con trazas**: hoy los logs (`slog`) no llevan el
+  `trace_id`. Añadirlo permitiría saltar de un log a su traza.
+- **Métricas del motor**: profundidad del libro y spread como gauges observables.
+  Requiere un hook de lectura sobre el libro que no interfiera con la goroutine
+  única, así que se dejó fuera.
+- **Trazas que cruzan el event log**: hoy la traza termina cuando el motor acepta
+  la orden. Propagar el contexto por Kafka (en los headers del record) uniría el
+  request con su liquidación asíncrona en una sola traza. Es el siguiente paso
+  natural y el más vistoso.
 
 ---
 

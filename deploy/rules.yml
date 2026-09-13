@@ -1,0 +1,86 @@
+# Alert rules that encode the system's operational invariants.
+#
+# These are the rules worth having: each one maps to a specific failure mode
+# discussed in the README, rather than generic CPU/memory noise.
+
+groups:
+  - name: orderbook-money
+    rules:
+      # THE alert. Trading moves value between users but must never create or
+      # destroy it.
+      #
+      # The rule watches for the supply going DOWN rather than merely changing,
+      # because that asymmetry makes it sharp: seeding a wallet is a deposit and
+      # legitimately increases the total, while nothing in normal operation ever
+      # decreases it. A drop means value was destroyed — exactly the signature of
+      # a half-applied trade, where a buyer is debited and the seller never
+      # credited.
+      #
+      # `for: 1m` is deliberate: the reconciliation job reads wallets
+      # non-transactionally, so one sample can catch a trade mid-settlement and
+      # show a transient blip. Only a discrepancy that PERSISTS is a real bug.
+      - alert: MoneyDestroyed
+        expr: |
+          delta(orderbook_supply_cop[5m]) < 0
+          or delta(orderbook_supply_vibranium[5m]) < 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Money supply decreased: value was destroyed"
+          description: >
+            Total COP or Vibranium across all wallets went down. Deposits only
+            ever increase it, so this points at settlement applying one leg of a
+            trade without the other. Audit the settlement path immediately.
+
+      # Settlement failing means trades executed that could not be applied to
+      # wallets: the book and the ledger have diverged.
+      - alert: SettlementFailures
+        expr: increase(orderbook_settlement_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Settlement could not apply events"
+          description: >
+            An executed trade failed to settle. The order book and the wallet
+            ledger are out of sync; check for upstream reservation violations.
+
+  - name: orderbook-pipeline
+    rules:
+      # Settlement is the slowest stage of the pipeline. Sustained lag means it
+      # is falling behind the matching engine, which shows up to users as
+      # balances that take too long to reflect their trades.
+      - alert: SettlementLagHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(orderbook_settlement_lag_milliseconds_bucket[5m])) by (le)
+          ) > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Settlement is falling behind the engine (p95 lag > 5s)"
+
+      # The accept path is what a client waits on: validate, reserve, match.
+      - alert: OrderAcceptLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(orderbook_order_accept_duration_milliseconds_bucket[5m])) by (le)
+          ) > 250
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order acceptance p99 above 250ms"
+
+      # Fails closed on money: a spike here usually means the wallet store is
+      # unreachable, so no order can enter the book.
+      - alert: OrdersRejectedByInfrastructure
+        expr: |
+          increase(orderbook_orders_rejected_total{reason="wallet_store_unavailable"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Orders are being rejected because the wallet store is down"

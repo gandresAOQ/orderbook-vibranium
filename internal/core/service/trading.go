@@ -26,16 +26,29 @@ type Trading struct {
 	engine  port.MatchingEngine
 	wallets port.WalletRepository
 	orders  port.OrderRepository
+	metrics port.Metrics
 	now     func() time.Time
 }
 
-// NewTrading builds the trading use case.
-func NewTrading(symbol string, engine port.MatchingEngine, wallets port.WalletRepository, orders port.OrderRepository) *Trading {
-	return &Trading{symbol: symbol, engine: engine, wallets: wallets, orders: orders, now: time.Now}
+// NewTrading builds the trading use case. `metrics` may be a no-op sink; it is
+// never nil, so the call sites below stay unconditional.
+func NewTrading(
+	symbol string,
+	engine port.MatchingEngine,
+	wallets port.WalletRepository,
+	orders port.OrderRepository,
+	metrics port.Metrics,
+) *Trading {
+	return &Trading{
+		symbol: symbol, engine: engine, wallets: wallets,
+		orders: orders, metrics: metrics, now: time.Now,
+	}
 }
 
 // PlaceOrder validates the command, reserves funds and submits to the engine.
 func (t *Trading) PlaceOrder(ctx context.Context, cmd port.PlaceOrderCommand) (*domain.Order, error) {
+	started := t.now()
+
 	order := &domain.Order{
 		ID:        generateID("ord"),
 		UserID:    cmd.UserID,
@@ -46,6 +59,7 @@ func (t *Trading) PlaceOrder(ctx context.Context, cmd port.PlaceOrderCommand) (*
 		CreatedAt: t.now(),
 	}
 	if err := order.Validate(); err != nil {
+		t.metrics.OrderRejected(ctx, "validation")
 		return nil, err
 	}
 
@@ -57,12 +71,15 @@ func (t *Trading) PlaceOrder(ctx context.Context, cmd port.PlaceOrderCommand) (*
 			// Return the rejected order alongside the balance error so the
 			// caller can render it (HTTP 422 with the order body).
 			order.Status = domain.StatusRejected
+			t.metrics.OrderRejected(ctx, "insufficient_funds")
 			return order, err
 		case errors.Is(err, domain.ErrWalletNotFound):
+			t.metrics.OrderRejected(ctx, "wallet_not_found")
 			return nil, err
 		default:
 			// Infrastructure failure (e.g. the wallet store is down). Tag it so
 			// the adapter reports the real cause instead of blaming the engine.
+			t.metrics.OrderRejected(ctx, "wallet_store_unavailable")
 			return nil, fmt.Errorf("%w: %w", ErrReservationFailed, err)
 		}
 	}
@@ -71,8 +88,12 @@ func (t *Trading) PlaceOrder(ctx context.Context, cmd port.PlaceOrderCommand) (*
 	if err != nil {
 		// Engine unreachable/cancelled: undo the reservation so funds are freed.
 		t.release(ctx, order)
+		t.metrics.OrderRejected(ctx, "engine_unavailable")
 		return nil, err
 	}
+
+	// Latency of the whole accept path, which is what the client actually waits on.
+	t.metrics.OrderPlaced(ctx, result.Side, result.Status, t.now().Sub(started))
 	return result, nil
 }
 

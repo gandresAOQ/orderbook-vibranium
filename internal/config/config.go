@@ -58,6 +58,21 @@ type Config struct {
 	// InfraWaitTimeout bounds how long startup waits for dependencies to
 	// become reachable (containers often start out of order).
 	InfraWaitTimeout time.Duration
+
+	// --- Observability (OpenTelemetry) ---
+
+	// TelemetryEnabled turns metrics and tracing on. When false the core still
+	// calls the Metrics port, but it is wired to a no-op sink.
+	TelemetryEnabled bool
+	ServiceName      string
+	ServiceVersion   string
+	// OTLPEndpoint receives traces (e.g. "jaeger:4317"). Empty leaves tracing
+	// off while metrics stay on, since metrics are scraped, not pushed.
+	OTLPEndpoint     string
+	TraceSampleRatio float64
+	// ReconcileInterval is how often the money-supply invariant is sampled.
+	// Zero disables the job.
+	ReconcileInterval time.Duration
 }
 
 // Load reads configuration from the environment.
@@ -87,6 +102,13 @@ func Load() Config {
 		RedisTTL: getEnvDuration("REDIS_TTL", 2*time.Second),
 
 		InfraWaitTimeout: getEnvDuration("INFRA_WAIT_TIMEOUT", 60*time.Second),
+
+		TelemetryEnabled:  getEnvBool("TELEMETRY_ENABLED", true),
+		ServiceName:       getEnv("OTEL_SERVICE_NAME", "orderbook"),
+		ServiceVersion:    getEnv("SERVICE_VERSION", "0.1.0"),
+		OTLPEndpoint:      getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		TraceSampleRatio:  getEnvFloat("OTEL_TRACES_SAMPLER_RATIO", 0.05),
+		ReconcileInterval: getEnvDuration("RECONCILE_INTERVAL", 15*time.Second),
 	}
 }
 
@@ -117,6 +139,24 @@ func getEnvInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func getEnvBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+func getEnvFloat(key string, def float64) float64 {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

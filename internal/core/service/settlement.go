@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/meli/orderbook/internal/core/domain"
 	"github.com/meli/orderbook/internal/core/port"
@@ -22,24 +23,31 @@ type Settlement struct {
 	wallets port.WalletRepository
 	trades  port.TradeRepository
 	orders  port.OrderRepository
+	metrics port.Metrics
 	logger  *slog.Logger
+	now     func() time.Time
 }
 
 // NewSettlement creates the settlement use case. `journal` provides idempotency
 // against redelivered events; it is required (use the in-memory journal when
-// running on the in-process log, where redelivery cannot happen).
+// running on the in-process log, where redelivery cannot happen). `metrics` may
+// be a no-op sink but is never nil.
 func NewSettlement(
 	log port.EventLog,
 	journal port.EventJournal,
 	wallets port.WalletRepository,
 	trades port.TradeRepository,
 	orders port.OrderRepository,
+	metrics port.Metrics,
 	logger *slog.Logger,
 ) *Settlement {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Settlement{log: log, journal: journal, wallets: wallets, trades: trades, orders: orders, logger: logger}
+	return &Settlement{
+		log: log, journal: journal, wallets: wallets, trades: trades,
+		orders: orders, metrics: metrics, logger: logger, now: time.Now,
+	}
 }
 
 // Run consumes events until the stream closes or ctx is cancelled. Run in its
@@ -74,6 +82,7 @@ func (s *Settlement) handle(ctx context.Context, ev domain.Event) {
 	if err != nil {
 		s.logger.Error("settlement journal unavailable, skipping event",
 			"event", ev.ID, "type", ev.Type, "err", err)
+		s.metrics.SettlementApplied(ctx, ev.Type, 0, err)
 		return
 	}
 	if !fresh {
@@ -81,6 +90,16 @@ func (s *Settlement) handle(ctx context.Context, ev domain.Event) {
 		return
 	}
 	s.apply(ctx, ev)
+
+	// Lag is measured from when the ENGINE stamped the event, so it captures the
+	// whole asynchronous hop (log transport + queueing + apply). It is the health
+	// signal for the pipeline: a growing lag means settlement is falling behind
+	// the matching engine.
+	var lag time.Duration
+	if !ev.At.IsZero() {
+		lag = s.now().Sub(ev.At)
+	}
+	s.metrics.SettlementApplied(ctx, ev.Type, lag, nil)
 }
 
 func (s *Settlement) apply(ctx context.Context, ev domain.Event) {
@@ -124,6 +143,7 @@ func (s *Settlement) applyTrade(ctx context.Context, t *domain.Trade) {
 	if err := s.trades.Append(ctx, *t); err != nil {
 		s.logger.Error("trade history append failed", "trade", t.ID, "err", err)
 	}
+	s.metrics.TradeExecuted(ctx, *t)
 }
 
 // applyOrderUpdate refreshes the order projection and returns any funds the

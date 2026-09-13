@@ -1,6 +1,6 @@
 .PHONY: build run test vet fmt tidy loadtest clean \
         up down logs ps reset psql topic groups replay-test \
-        up-memory down-memory diagram
+        up-memory down-memory metrics alerts supply diagram
 
 # ---------- local (no infrastructure) ----------
 
@@ -82,6 +82,17 @@ topic: ## show the event log topic
 
 groups: ## show settlement consumer lag
 	docker compose exec redpanda rpk group describe settlement
+
+metrics: ## print the domain metrics (labels stripped for readability)
+	@curl -s localhost:3000/metrics | grep -E "^orderbook_" | sed 's/{[^}]*}//' | sort
+
+alerts: ## show alert rule state from Prometheus
+	@curl -s localhost:9090/api/v1/rules | python3 -c "import sys,json;\
+[print(f\"  {r['name']:32} {r.get('state','inactive'):9} {r.get('health')}\") \
+for g in json.load(sys.stdin)['data']['groups'] for r in g['rules']]"
+
+supply: ## show the money-supply invariant gauges (must stay flat)
+	@curl -s localhost:3000/metrics | grep -E "^orderbook_supply" | sed 's/{[^}]*}//'
 
 # Force a full redelivery of the event log and prove money is not duplicated.
 replay-test: ## rewind settlement to offset 0 and verify balances are unchanged

@@ -43,6 +43,17 @@ services:
 
       ENGINE_BUFFER: "65536"
       INFRA_WAIT_TIMEOUT: "60s"
+
+      # --- Observability (OpenTelemetry) ---
+      # Metrics are exposed on /metrics for Prometheus to scrape (pull).
+      # Traces are pushed over OTLP to Jaeger.
+      TELEMETRY_ENABLED: "true"
+      OTEL_SERVICE_NAME: "orderbook"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Sample every trace locally so the demo always shows something. In
+      # production this would be a few percent.
+      OTEL_TRACES_SAMPLER_RATIO: "1.0"
+      RECONCILE_INTERVAL: "10s"
     depends_on:
       redpanda:
         condition: service_healthy
@@ -131,6 +142,37 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
+    restart: unless-stopped
+
+  # --- Observability ---
+
+  # Scrapes /metrics off the app and evaluates the alert rules in deploy/rules.yml.
+  # Those rules are the interesting part: they encode the money invariant and the
+  # pipeline lag, not generic CPU graphs.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/rules.yml:/etc/prometheus/rules.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      orderbook:
+        condition: service_started
+    restart: unless-stopped
+
+  # Receives traces over OTLP. Shows the full accept path of an order as a span
+  # tree, which is how you see WHERE the latency actually goes.
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC
     restart: unless-stopped
 
 volumes:

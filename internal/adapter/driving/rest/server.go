@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/meli/orderbook/internal/core/port"
 )
@@ -20,6 +23,26 @@ type Server struct {
 	market  port.MarketDataService
 	wallets port.WalletService
 	logger  *slog.Logger
+
+	// metricsHandler serves the Prometheus scrape endpoint. Nil disables the
+	// route, so the API is identical whether or not telemetry is enabled.
+	metricsHandler http.Handler
+	// tracing wraps the router with OpenTelemetry HTTP instrumentation.
+	tracing bool
+}
+
+// Option configures optional server behaviour.
+type Option func(*Server)
+
+// WithMetricsEndpoint exposes h at GET /metrics.
+func WithMetricsEndpoint(h http.Handler) Option {
+	return func(s *Server) { s.metricsHandler = h }
+}
+
+// WithTracing wraps the router in otelhttp so every request becomes a span and
+// incoming W3C traceparent headers are honoured.
+func WithTracing() Option {
+	return func(s *Server) { s.tracing = true }
 }
 
 // NewServer builds an API server wired to the application services.
@@ -29,11 +52,16 @@ func NewServer(
 	market port.MarketDataService,
 	wallets port.WalletService,
 	logger *slog.Logger,
+	opts ...Option,
 ) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{symbol: symbol, trading: trading, market: market, wallets: wallets, logger: logger}
+	s := &Server{symbol: symbol, trading: trading, market: market, wallets: wallets, logger: logger}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler returns the configured HTTP handler (router).
@@ -56,7 +84,53 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /book", s.handleGetBook)
 	mux.HandleFunc("GET /trades", s.handleGetTrades)
 
-	return logging(s.logger, mux)
+	// Observability: Prometheus scrape endpoint (pull model).
+	if s.metricsHandler != nil {
+		mux.Handle("GET /metrics", s.metricsHandler)
+	}
+
+	var h http.Handler = logging(s.logger, mux)
+	if s.tracing {
+		// otelhttp reads the incoming traceparent, starts a server span and
+		// injects it into the request context, so everything the handlers call
+		// downstream is automatically part of the same trace.
+		//
+		// The span name comes from the ROUTE pattern, not the raw path: naming
+		// spans after "/orders/ord-9f3a..." would create unbounded span names.
+		h = otelhttp.NewHandler(h, "orderbook",
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				if pattern := routePattern(r); pattern != "" {
+					return r.Method + " " + pattern
+				}
+				return r.Method
+			}),
+			// Scraping our own metrics endpoint would generate a span per scrape.
+			otelhttp.WithFilter(func(r *http.Request) bool {
+				return r.URL.Path != "/metrics" && r.URL.Path != "/health"
+			}),
+		)
+	}
+	return h
+}
+
+// routePattern collapses identifiers into the matched route so span names stay
+// low-cardinality (e.g. "DELETE /orders/{id}" rather than one name per order).
+func routePattern(r *http.Request) string {
+	path := r.URL.Path
+	switch {
+	case path == "/orders":
+		return "/orders"
+	case strings.HasPrefix(path, "/orders/"):
+		return "/orders/{id}"
+	case path == "/wallets":
+		return "/wallets"
+	case strings.HasPrefix(path, "/wallets/"):
+		return "/wallets/{id}"
+	case path == "/book", path == "/trades":
+		return path
+	default:
+		return ""
+	}
 }
 
 // --- helpers ---
